@@ -51,7 +51,7 @@ Cordova 提供了一个**框架和标准**，使开发者完全不需要考虑�
 Cordova 使用 HTML、CSS 和 JS 构建移动应用，它是一个**容器**，用于将 Web 应用程序与本机移动功能连接，生成完整的 APP 应用。
 
 - 使用 JS 编写，不需要学习平台特定语言
-- Cordova 也可作为**插件（plugin）**在其他 H5 应用中引入并和本地资源交互
+- Cordova 也可作为**插件**（plugin）在其他 H5 应用中引入并和本地资源交互
 - Cordova 插件由 JS + 原生代码组成，打包时整体编译
 - 需要 Android SDK 或 iOS Xcode
 

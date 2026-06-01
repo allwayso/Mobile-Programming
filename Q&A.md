@@ -38,15 +38,8 @@ WebView 是一个**完整的浏览器引擎**，不是一段 JS 代码，也不�
 
 Js Bridge 指的就是 Webview 中的 JS 引擎与原生层之间的交互方式
 
-JS->JS Bridge->Native：
-1. 将 JS 侧传递的参数（通常是 JSON 字符串）反序列化为原生可识别的数据结构
-2. 将此次调用注册到一个回调表中，生成唯一的回调 ID（callbackId），以便后续将结果精确返回给对应的 JS 函数
-3. 根据调用的方法名路由到对应的原生模块。
-
-Native->JS Bridge->JS:
-1. 原生层获取到位置数据后，将结果封装为 JSON 格式，携带之前的 callbackId，通过 JS Bridge 回传。
-2. Android 端通过 `WebView.evaluateJavascript()`（或将 JS 代码拼接到 `loadUrl("javascript:callback(data)")` 中）将结果注入到 WebView 的 JS 执行环境中。
-3. JS Bridge 根据 callbackId 找到之前注册的回调函数，执行回调，H5 页面获得位置数据并更新 UI。
+JS->原生层：[[第2章-H5交互调用#§2 JS 调用原生应用]]
+原生层->JS:[[第2章-H5交互调用#§3 原生应用调用 JS]]
 ### A1.3 Hybrid的请求链路
 
 请求可以分为两种，一种调用原生系统（如android）接口，一种是向服务器发起请求
@@ -379,3 +372,328 @@ my-angular-app/                          ← 项目根目录（本身就是一�
 └── app-routing.module.ts  → URL ↔ 组件的路由映射表
 
 ```
+
+## Q5 JS 和 原生层 之间各种交互方式的原理是什么？
+
+### A5.1 JS->原生层
+
+[[第2章-H5交互调用#§2 JS 调用原生应用]]中给出了三种方法 ，这里结合代码详细解释
+
+1. 对象映射：在初始化webview的时候，将一个java对象（经过`@JavascriptInterface` 注释允许被JS调用）直接注入 JS 全局作用域（指通过`webView.addJavasriptInterface`函数创建window对象），JS 可以操作这个对象，但是实际上触发的是原生层中java对象
+
+```
+┌─ H5 (WebView 中的 JS) ──────────────────────────────────┐
+│                                                          │
+│  window.launcher.showToast("你好")                       │  ← JS 以为在调 JS 方法
+│       │                                                  │
+└───────┼──────────────────────────────────────────────────┘
+        │  WebView 内部拦截了这个"假调用"
+        │  通过 JNI 跨语言调用
+        ▼
+┌─ 原生层 (Java/Kotlin) ──────────────────────────────────┐
+│                                                          │
+│  class JsInterface {                                    │
+│    @JavascriptInterface                                  │  ← 这个注解就是"允许 JS 调我"
+│    public void showToast(String msg) {                  │
+│      Toast.makeText(context, msg, ...).show();          │  ← 真正执行原生功能
+│    }                                                     │
+│  }                                                       │
+│                                                          │
+│  // WebView 初始化时                                   │
+│  webView.addJavascriptInterface(                         │
+│    new JsInterface(this),  // 创建原生对象               │
+│    "launcher"              // 映射为 JS 中的 window.launcher
+│  );                                                      │
+└──────────────────────────────────────────────────────────┘
+
+```
+
+2. URL拦截：JS 不能调用原生方法，但是通过URL跳转可以触发webView导航。原生层在webView中设置一个接受URL的函数作为门卫（示例中的`shouldOverrideUrlLoading`函数），这个门卫在接受特殊格式的URL（示例中的`js://xxxx`）时并不执行页面跳转，而是解析里面的信息并执行操作；当接受正常格式的URL时，则进行页面跳转
+
+```
+┌─ H5 ────────────────────────────────────────────────────┐
+│                                                          │
+│  // JS 构造一条特殊的 URL                               │
+│  window.location.href = "js://showToast?msg=你好&duration=long";
+│       │                                                  │
+│       │  这个 URL 要离开 WebView 去加载                   │
+└───────┼──────────────────────────────────────────────────┘
+        │
+        ▼
+┌─ 原生层的 WebViewClient ────────────────────────────────┐
+│                                                          │
+│  @Override                                               │
+│  public boolean shouldOverrideUrlLoading(               │
+│      WebView view, String url) {                        │
+│                                                          │
+│    if (url.startsWith("js://")) {   // 发现了！是我们约定的协议 │
+│      // 解析 URL：js://showToast?msg=你好&duration=long │
+│      String method = url.substring(5, url.indexOf("?"));// "showToast"
+│      String params = url.substring(url.indexOf("?")+1); // "msg=你好&duration=long"
+│                                                        │
+│      // 根据方法名执行对应逻辑                          │
+│      if (method.equals("showToast")) {                 │
+│        String msg = parseParam(params, "msg");         │
+│        Toast.makeText(context, msg, ...).show();       │
+│      }                                                  │
+│      return true;  // ← 关键！返回 true 表示"我处理了，别真导航" │
+│    }                                                    │
+│    return false; // 普通 URL 正常加载                    │
+│  }                                                      │
+└──────────────────────────────────────────────────────────┘
+
+```
+
+3. 对话框拦截：JS有三个内置ui api函数（alert，confirm和prompt），创建webView时将这三个函数暴露给原生层。当JS发出带特殊的message的prompt请求时，执行解析并执行特定操作，这个方法可以有返回值
+
+```
+┌─ H5 ─────────────────────────────────────────────────────────┐
+│                                                               │
+│  // JS 调用内置 prompt()，但它不是真弹窗                       │
+│  var result = prompt("native:getLocation", "");               │
+│  // prompt(消息, 默认值) —— 这里的"消息"就是我们要传的指令     │
+│  // 返回值就是原生层回传的数据                                  │
+│       │                                                       │
+└───────┼───────────────────────────────────────────────────────┘
+        │  WebView 内核检测到 prompt() 被调用
+        │  触发 WebChromeClient.onJsPrompt() 回调
+        ▼
+┌─ 原生层的 WebChromeClient ───────────────────────────────────┐
+│                                                               │
+│  @Override                                                    │
+│  public boolean onJsPrompt(WebView view, String url,          │
+│      String message,        // "native:getLocation"           │
+│      String defaultValue,   // ""（不用）                     │
+│      JsPromptResult result) // 用来回传给 JS 的通道            │
+│  {                                                            │
+│    if (message.startsWith("native:")) {   // 发现暗号！       │
+│      String cmd = message.substring(7);  // "getLocation"     │
+│      // 执行原生操作...                                       │
+│      String response = getNativeLocation();  // "经度:120, 纬度:30" │
+│                                                               │
+│      result.confirm(response); // ← 把结果传回给 JS 的变量！   │
+│      return true;  // 返回 true 表示"我处理了，别弹系统对话框"  │
+│    }                                                           │
+│    return false; // 不是暗号，正常弹窗                          │
+│  }                                                             │
+└───────────────────────────────────────────────────────────────┘
+        │
+        │  result.confirm(response) 把数据传回
+        ▼
+┌─ H5 ─────────────────────────────────────────────────────────┐
+│  var location = prompt("native:getLocation", "");             │
+│  console.log(location);  // "经度:120, 纬度:30"               │
+│  ← JS 同步拿到了原生的返回结果！                               │
+└───────────────────────────────────────────────────────────────┘
+
+```
+
+**三者的对比总览**:
+
+|维度|方法1：对象映射|方法2：URL 拦截|方法3：弹窗拦截|
+|---|---|---|---|
+|JS 端语法|`window.launcher.xxx()`|`location.href = 'js://...'`|`prompt('native:xxx')`|
+|JS 能收到返回值|✅ 直接 return|❌ 需原生反向调 JS|✅ prompt 可同步接收|
+|传递数据量|中等|受 URL 长度限制|受字符串限制|
+|安全性（Android 4.2-）|❌ 有漏洞|✅ 安全|✅ 安全|
+|适合大规模方法数|✅ 一次注入，多个方法|⚠️ 需自己维护 case 分支|⚠️ 所有调用走同一个回调|
+|实际项目常用度|⭐⭐⭐⭐⭐ (最常用)|⭐⭐⭐|⭐⭐|
+### A5.2 原生层->JS
+
+1. evaluateJavaScript ✔
+2. loadUrl ×
+
+## Q6 写完代码如何打包、发布、测试？为什么需要apk签名？
+
+[[第2章-H5交互调用#环境与打包工具]]中的表格并不是很明确，这里稍微解释一下
+
+### A6.1 各个工具的作用
+
+| 工具                    | 用途                            |
+| --------------------- | ----------------------------- |
+| **Android SDK + JDK** | 环境准备：前者编译android代码，后者编译java代码 |
+| **Gradle**            | 打包工具：形成.apk文件                 |
+| **emulator**          | 虚拟机：模拟移动端                     |
+| **adb**               | 调试桥：用于连接移动端进行调试               |
+
+### A6.2 apk签名
+
+APK签名的作用：
+
+- __身份认证__：证明"这个 APK 就是我开发的，没有被别人篡改过"。应用商店通过签名判断更新包是否来自同一开发者，签名不对就无法覆盖安装旧版本。
+
+- __完整性校验__：安装时 Android 系统会验证 APK 内文件的签名是否一致，任何一个文件被篡改都会导致签名验证失败，安装直接拒绝。
+
+- __权限信任__：同一签名的应用可以共享数据（如果声明了 `sharedUserId`），系统层面实现应用间互信。
+
+APK签名的流程：
+1. kaytool生成密钥库
+2. apksigner使用密钥库给apk签名
+3. apksigner验证签名是否成功
+
+具体代码示例：
+```
+# 步骤1：生成密钥库（keystore）——只在第一次发布时需要，以后用同一个
+keytool -genkey \
+  -alias helloalias \           # 别名：这把密钥的名字，一个 keystore 里可以存多把
+  -keyalg RSA \                 # 密钥算法：RSA 2048 位，目前行业标准
+  -keysize 2048 \
+  -validity 36500 \             # 有效期：36500 天 ≈ 100 年（基本永久）
+  -keystore hello.keystore      # 输出文件：密钥库文件，妥善保管，丢了就永远发不了更新
+
+# 执行后会交互式提问：
+# 姓名、组织、城市、国家等 → 这些信息会被编入证书
+# 需要设置密钥库密码和密钥密码
+
+# 步骤2：用生成的密钥签名 APK
+apksigner sign \
+  --ks hello.keystore \                    # 指定 keystore 文件
+  --out app-release-signed.apk \           # 输出：已签名的 APK
+  app-release-unsigned.apk                 # 输入：未签名的 APK
+
+# 步骤3：验证签名是否成功
+apksigner verify -v app-release-signed.apk
+# 输出类似：
+# Verifies
+# Verified using v1 scheme (JAR signing): true
+# Verified using v2 scheme (APK Signature Scheme v2): true
+# Verified using v3 scheme (APK Signature Scheme v3): true
+
+```
+
+## Q7 cordova 中 plugin.xml 的作用是什么
+
+### A7 从 plugin.xml 看 cordova
+
+plugin.xml框架：
+``` 
+┌───────────────────────────────────────────────────────┐
+│                   plugin.xml                          │
+│                                                       │
+│  ① 备案：告诉 Cordova 这个插件叫什么、有哪些 JS 方法   │
+│     → <js-module> + <clobbers>                        │
+│                                                       │
+│  ② 接线：把 JS 方法名和原生类关联在一起                │
+│     → <feature name="xxx"> + <param name="android-package" value="..."/> │
+│                                                       │
+│  ③ 搬运：把插件的源文件从插件目录复制到平台工程对应位置    │
+│     → <source-file src="..." target-dir="..." />      │
+│     → <config-file target="..." parent="...">         │
+│                                                       │
+└───────────────────────────────────────────────────────┘
+
+```
+
+plugin.xml代码示例：
+```xml
+<plugin id="com.testdialog" version="1.0.0"
+        xmlns="http://apache.org/cordova/ns/plugins/1.0">
+
+    <!-- ============ 第一部分：JS 端注册 ============ -->
+    <!-- 告诉 Cordova：生成 cordova_plugins.js 时加入这个模块 -->
+    <js-module src="www/TestDialog.js" name="TestDialog">
+        <!-- 前端通过这个名字调用 -->
+        <clobbers target="cordova.plugins.TestDialog" />
+        <!--          ↑                               -->
+        <!--  生成的全局对象路径                       -->
+        <!--  相当于 window.cordova.plugins.TestDialog -->
+    </js-module>
+    <!-- 效果：cordova.js 会自动把 www/TestDialog.js 的内容挂到 cordova.plugins.TestDialog 上 -->
+
+
+    <!-- ============ 第二部分：Android 平台配置 ============ -->
+    <platform name="android">
+
+        <!-- 2a. 接线：告诉 Cordova 原生实现类在哪里 -->
+        <config-file target="res/xml/config.xml" parent="/*">
+            <!-- feature name 必须和 js-module 的 name 一致，否则匹配不上！ -->
+            <feature name="TestDialog">
+                <param name="android-package" value="com.testdialog.TestDialog" />
+                <!--                      ↑ 完整包名.类名                       -->
+            </feature>
+        </config-file>
+
+        <!-- 2b. 搬运：把 Java 源文件复制到 Android 工程 -->
+        <source-file
+            src="src/android/TestDialog.java"
+            target-dir="src/com/testdialog" />
+        <!-- 插件目录: plugins/xxx/src/android/TestDialog.java           -->
+        <!-- 复制到:   platforms/android/.../src/com/testdialog/TestDialog.java -->
+
+    </platform>
+
+</plugin>
+
+```
+
+对应的映射关系：
+```
+┌────────────────────────────────────────────────────────────────┐
+│                     plugin.xml 映射关系图                       │
+│                                                                │
+│  [JS 调用时]                                                   │
+│  cordova.plugins.TestDialog.coolMethod("hello", succ, err)     │
+│       │                                                        │
+│       │ clobbers target="cordova.plugins.TestDialog"           │
+│       ▼                                                        │
+│  www/TestDialog.js                                             │
+│       │                                                        │
+│       │ cordova.exec(succ, err, "TestDialog", "coolMethod",..) │
+│       ▼                                                        │
+│  exec() 查找 feature name="TestDialog"                         │
+│       │                                                        │
+│       │ param android-package="com.testdialog.TestDialog"      │
+│       ▼                                                        │
+│  com.testdialog.TestDialog.execute("coolMethod", args, cb)     │
+│       │                                                        │
+│       │ 找到这个文件是因为 source-file 把它搬到了正确位置         │
+│       ▼                                                        │
+│  target-dir="src/com/testdialog" → com.testdialog.TestDialog   │
+│                                                                │
+└────────────────────────────────────────────────────────────────┘
+
+```
+
+## Q8  CORS 的作用是什么
+
+### A8.1 CORS 的目的
+
+[[第3章-服务端#CORS 跨域处理]]：限制网页从不同源（域名、协议、端口）请求资源
+
+### A8.2 CORS 的处理方式
+
+__处理方式__（笔记第 117-126 行）：
+
+```jsp
+response.setHeader("Access-Control-Allow-Origin", "*");       // 允许所有来源
+response.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
+response.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+
+// OPTIONS 预检请求——浏览器先发一个 OPTIONS 探路
+if ("OPTIONS".equalsIgnoreCase(request.getMethod())) {
+    response.setStatus(HttpServletResponse.SC_OK);
+    return;  // 直接返回，不需处理业务逻辑
+}
+```
+
+__执行流程__：
+
+```javascript
+浏览器                    JSP 服务端
+  │                         │
+  │──── OPTIONS 预检 ──────→│  ① 先问：允许 POST 吗？
+  │←─── CORS 头（200）──────│  ② 答：允许，所有来源都行
+  │                         │
+  │──── POST + JSON body ──→│  ③ 发送真正的请求
+  │←─── JSON 响应 ──────────│  ④ 返回数据
+```
+
+如果 JSP 没设置 CORS 头，浏览器会在第二步直接报错 `blocked by CORS policy`。
+
+## Q9 数据处理在哪里进行？
+
+### A9 数据库和后端的联动
+
+用数据库存储函数（Stored Function）封装数据处理逻辑，而不是把 SQL 写在 JSP 里
+
+并且需要注意，当采取统一分发的时候，可以通过一个url+不同param来对应不同的数据库函数
